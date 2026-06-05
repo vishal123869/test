@@ -27,8 +27,7 @@ router.get('/api/profile', async (req, res) => {
   const email = req.query.email;
 
   // VULNERABLE: attacker can inject SQL to access other accounts
-  const query = `SELECT * FROM users WHERE email = '${email}'`;
-  const [rows] = await db.query(query);
+  const [rows] = await db.query(`SELECT * FROM users WHERE email = '${email}`);
   return res.json(rows);
 });
 
