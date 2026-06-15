@@ -1,0 +1,152 @@
+name: "Supply Chain Guard"
+description: "Scan your repository for supply-chain malware indicators. Detects GlassWorm and similar campaigns."
+author: "Elvatis <emre.kohler@elvatis.com>"
+
+branding:
+  icon: "shield"
+  color: "red"
+
+inputs:
+  path:
+    description: "Path to scan (defaults to repository root)"
+    required: false
+    default: "."
+  format:
+    description: "Output format: text, json, markdown"
+    required: false
+    default: "markdown"
+  min-severity:
+    description: "Minimum severity to report: critical, high, medium, low, info"
+    required: false
+    default: "low"
+  exclude-rules:
+    description: "Comma-separated list of rule IDs to exclude"
+    required: false
+    default: ""
+  fail-on:
+    description: "Fail the check if findings at this severity or above are found: critical, high, medium, low"
+    required: false
+    default: "critical"
+  comment-on-pr:
+    description: "Post findings as a PR comment (true/false)"
+    required: false
+    default: "true"
+
+outputs:
+  score:
+    description: "Risk score (0-100)"
+  risk-level:
+    description: "Risk level: clean, low, medium, high, critical"
+  findings-count:
+    description: "Total number of findings"
+  report:
+    description: "Full scan report in the requested format"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+
+    - name: Install supply-chain-guard
+      shell: bash
+      run: npm install -g supply-chain-guard
+
+    - name: Run scan
+      id: scan
+      shell: bash
+      run: |
+        set +e
+
+        ARGS="scan ${{ inputs.path }} --format ${{ inputs.format }}"
+
+        if [ -n "${{ inputs.min-severity }}" ] && [ "${{ inputs.min-severity }}" != "" ]; then
+          ARGS="$ARGS --min-severity ${{ inputs.min-severity }}"
+        fi
+
+        if [ -n "${{ inputs.exclude-rules }}" ] && [ "${{ inputs.exclude-rules }}" != "" ]; then
+          ARGS="$ARGS --exclude ${{ inputs.exclude-rules }}"
+        fi
+
+        # Run scan and capture output
+        REPORT=$(supply-chain-guard $ARGS 2>&1)
+        EXIT_CODE=$?
+
+        # Also get JSON for parsing
+        JSON_REPORT=$(supply-chain-guard scan ${{ inputs.path }} --format json 2>/dev/null)
+
+        # Extract values from JSON
+        SCORE=$(echo "$JSON_REPORT" | jq -r '.score // 0')
+        RISK_LEVEL=$(echo "$JSON_REPORT" | jq -r '.riskLevel // "unknown"')
+        FINDINGS_COUNT=$(echo "$JSON_REPORT" | jq -r '.findings | length // 0')
+
+        echo "score=$SCORE" >> $GITHUB_OUTPUT
+        echo "risk-level=$RISK_LEVEL" >> $GITHUB_OUTPUT
+        echo "findings-count=$FINDINGS_COUNT" >> $GITHUB_OUTPUT
+
+        # Save report to file for multi-line output
+        echo "$REPORT" > /tmp/scg-report.txt
+        {
+          echo "report<<EOF"
+          cat /tmp/scg-report.txt
+          echo "EOF"
+        } >> $GITHUB_OUTPUT
+
+        # Print report to log
+        echo "$REPORT"
+
+        # Determine if we should fail
+        FAIL_SEVERITY="${{ inputs.fail-on }}"
+        case "$FAIL_SEVERITY" in
+          critical)
+            [ "$(echo "$JSON_REPORT" | jq '.summary.critical')" -gt 0 ] && exit 2
+            ;;
+          high)
+            [ "$(echo "$JSON_REPORT" | jq '.summary.critical + .summary.high')" -gt 0 ] && exit 1
+            ;;
+          medium)
+            [ "$(echo "$JSON_REPORT" | jq '.summary.critical + .summary.high + .summary.medium')" -gt 0 ] && exit 1
+            ;;
+          low)
+            [ "$(echo "$JSON_REPORT" | jq '.summary.critical + .summary.high + .summary.medium + .summary.low')" -gt 0 ] && exit 1
+            ;;
+        esac
+
+        exit 0
+
+    - name: Comment on PR
+      if: inputs.comment-on-pr == 'true' && github.event_name == 'pull_request' && steps.scan.outputs.findings-count != '0'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const report = `${{ steps.scan.outputs.report }}`;
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+
+          // Update existing comment or create new one
+          const botComment = comments.find(
+            (c) => c.body?.includes('supply-chain-guard Scan Report')
+          );
+
+          const body = report || '## 🛡️ supply-chain-guard Scan Report\n\n> ✅ No malicious indicators detected.';
+
+          if (botComment) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: botComment.id,
+              body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+          }
